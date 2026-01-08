@@ -5,7 +5,6 @@
 //! metrics call path as structured `tracing` events.
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -139,6 +138,7 @@ impl Recorder for TracingRecorder {
     }
 }
 
+// Shared recorder state: defaults, describe de-dup, and callsite cache.
 struct Inner {
     default_level: TracingLevel,
     default_target: Arc<str>,
@@ -148,13 +148,11 @@ struct Inner {
 
 impl Inner {
     fn resolve_target(&self, target: &str) -> Arc<str> {
-        if target.is_empty() {
-            return Arc::clone(&self.default_target);
+        if target.is_empty() || target == self.default_target.as_ref() {
+            Arc::clone(&self.default_target)
+        } else {
+            Arc::from(target)
         }
-        if target == &*self.default_target {
-            return Arc::clone(&self.default_target);
-        }
-        Arc::from(target.to_string())
     }
 
     fn describe(
@@ -171,11 +169,11 @@ impl Inner {
         let target = Arc::clone(&self.default_target);
         let level = self.default_level;
 
-        let event_value = EVENT_DESCRIBE.to_string();
-        let name_value = key.as_str().to_string();
-        let kind_value = kind.as_ref().to_string();
-        let description_value = description.to_string();
-        let unit_value = unit.map(|u| u.as_str().to_string());
+        let event_value = EVENT_DESCRIBE;
+        let name_value = key.as_str();
+        let kind_value = kind.as_ref();
+        let description_value = description.as_ref();
+        let unit_value = unit.map(|unit| unit.as_str());
 
         let values: [Option<&dyn Value>; 5] = [
             Some(&event_value as &dyn Value),
@@ -196,10 +194,10 @@ impl Inner {
         op: CounterOp,
         value: u64,
     ) {
-        let event_value = EVENT_EMIT.to_string();
-        let name_value = key.name().to_string();
-        let kind_value = MetricKind::Counter.as_ref().to_string();
-        let op_value = op.as_ref().to_string();
+        let event_value = EVENT_EMIT;
+        let name_value = key.name();
+        let kind_value = MetricKind::Counter.as_ref();
+        let op_value = op.as_ref();
         let labels_debug = LabelsDebug::from_key(key);
         let labels_value = field::debug(labels_debug);
         let values: [Option<&dyn Value>; 6] = [
@@ -222,10 +220,10 @@ impl Inner {
         op: GaugeOp,
         value: f64,
     ) {
-        let event_value = EVENT_EMIT.to_string();
-        let name_value = key.name().to_string();
-        let kind_value = MetricKind::Gauge.as_ref().to_string();
-        let op_value = op.as_ref().to_string();
+        let event_value = EVENT_EMIT;
+        let name_value = key.name();
+        let kind_value = MetricKind::Gauge.as_ref();
+        let op_value = op.as_ref();
         let labels_debug = LabelsDebug::from_key(key);
         let labels_value = field::debug(labels_debug);
         let values: [Option<&dyn Value>; 6] = [
@@ -241,10 +239,10 @@ impl Inner {
     }
 
     fn emit_histogram(&self, key: &Key, target: &Arc<str>, level: TracingLevel, value: f64) {
-        let event_value = EVENT_EMIT.to_string();
-        let name_value = key.name().to_string();
-        let kind_value = MetricKind::Histogram.as_ref().to_string();
-        let op_value = HistogramOp::Sample.as_ref().to_string();
+        let event_value = EVENT_EMIT;
+        let name_value = key.name();
+        let kind_value = MetricKind::Histogram.as_ref();
+        let op_value = HistogramOp::Sample.as_ref();
         let labels_debug = LabelsDebug::from_key(key);
         let labels_value = field::debug(labels_debug);
         let values: [Option<&dyn Value>; 6] = [
@@ -367,19 +365,11 @@ struct SeenKey {
     kind: MetricKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct CallsiteKey {
     schema: Schema,
     level: u8,
     target: Arc<str>,
-}
-
-impl Hash for CallsiteKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.schema.hash(state);
-        self.level.hash(state);
-        self.target.hash(state);
-    }
 }
 
 const EVENT_EMIT: &str = "emit";
@@ -388,6 +378,7 @@ const EVENT_DESCRIBE: &str = "describe";
 const EMIT_FIELDS: [&str; 6] = ["event", "name", "kind", "labels", "value", "op"];
 const DESCRIBE_FIELDS: [&str; 5] = ["event", "name", "kind", "description", "unit"];
 
+// Stores a callsite's `Interest` in a compact atomic encoding.
 struct DynamicCallsite {
     metadata: OnceLock<TracingMetadata<'static>>,
     interest: AtomicU8,
@@ -406,7 +397,9 @@ impl DynamicCallsite {
     }
 
     fn set_metadata(&self, metadata: TracingMetadata<'static>) {
-        let _ = self.metadata.set(metadata);
+        self.metadata
+            .set(metadata)
+            .expect("callsite metadata set once");
     }
 
     fn metadata_static(&'static self) -> &'static TracingMetadata<'static> {
@@ -444,6 +437,8 @@ impl Callsite for DynamicCallsite {
 }
 
 fn build_callsite(schema: Schema, level: TracingLevel, target: &str) -> &'static DynamicCallsite {
+    // NOTE: `tracing` requires callsites and metadata to live for the program's
+    // lifetime, so we intentionally leak the callsite and target string.
     let callsite = Box::leak(Box::new(DynamicCallsite::new()));
     let target_static: &'static str = Box::leak(target.to_string().into_boxed_str());
     let fields = FieldSet::new(schema.field_names(), callsite::Identifier(callsite));
