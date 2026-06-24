@@ -1,0 +1,25 @@
+# Standalone crate nested in the ApertureC tree; an empty workspace table keeps it out of the
+# parent workspace while still building on its own.
+[workspace]
+
+[package]
+name = "metrics-exporter-tracing"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A metrics recorder that emits aggregated periodic snapshots — and optional filtered per-call events — as structured tracing events"
+repository = "https://github.com/Zetier/metrics-exporter-tracing"
+keywords = ["metrics", "tracing", "observability", "telemetry", "recorder"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
+
+[features]
+stream = ["dep:globset"]
+
+[dependencies]
+metrics = "0.24"
+metrics-util = "0.20"
+tracing = "0.1"
+globset = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"

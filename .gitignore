@@ -1,0 +1,6 @@
+/target
+/artifacts
+/aperturec_tests/
+/ci/release-please/node_modules/
+__pycache__/
+*.py[cod]
