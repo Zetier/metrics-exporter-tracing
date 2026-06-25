@@ -1,7 +1,16 @@
 [package]
 name = "metrics-exporter-tracing"
 version = "0.1.0"
+authors = [
+  "ApertureC Team <aperturec@zetier.com>",
+  "Joe Kale <joe@zetier.com>"
+]
 edition = "2024"
+repository = "https://github.com/zetier/metrics-exporter-tracing"
+description = "A metrics recorder that emits metric updates as structured tracing events"
+license = "MIT OR Apache-2.0"
+keywords = ["metrics", "tracing", "exporter", "recorder", "debugging"]
+categories = ["development-tools::debugging"]
 
 [dependencies]
 metrics = "0.24"
