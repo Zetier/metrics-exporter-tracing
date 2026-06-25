@@ -13,9 +13,11 @@ metrics through it than stand up a separate metrics pipeline.
   carry `count, sum, p50, p90, p99`; counters and gauges carry `value`. Histogram storage stays
   bounded because raw observations are drained into a per-key DDSketch each tick, so memory scales
   with the number of distinct keys, not with observation volume.
-- **Per-call stream (opt-in).** When a [`StreamFilter`](#stream-filtering) is configured, keys that
-  pass the filter *also* emit an `event = "emit"` event on every update. Keys that don't match (or
-  when no filter is set) use the bare registry handle with zero per-call overhead — snapshot only.
+- **Per-call stream (opt-in).** When a [`StreamFilter`](#stream-filtering) is configured by calling
+  `.stream(filter)` on the builder, keys that pass the filter *also* emit an `event = "emit"` event
+  on every update. Keys that don't match (or when no filter is set) use the bare registry handle
+  with zero per-call overhead — snapshot only. No Cargo feature is required; streaming is always
+  compiled in and toggled at runtime.
 
 ## Fixed target, runtime scope
 
@@ -97,7 +99,7 @@ A `StreamFilter` controls which keys produce per-call `event = "emit"` events. I
 ```rust
 use metrics_exporter_tracing::{StreamFilter, TracingRecorder};
 
-let filter = StreamFilter::new()
+let filter = StreamFilter::builder()
     .allow(["requests_*", "in_flight"])
     .deny(["requests_internal"])
     .histograms(["latency_ms"])
@@ -172,6 +174,3 @@ impl StreamFilter { pub fn new() -> StreamFilterBuilder; }
 - This crate targets debugging and development workflows rather than production-grade metrics
   export. For production, pair it with a real exporter (e.g. Prometheus) via a `Fanout`.
 
-## License
-
-Licensed under either of Apache-2.0 or MIT at your option.

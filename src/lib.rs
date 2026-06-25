@@ -11,6 +11,7 @@
 //! * **Per-call stream (opt-in):** when a [`StreamFilter`] is configured, keys that pass the filter
 //!   also emit an `event="emit"` tracing event on every update. Histograms only stream when their
 //!   key matches an explicit histogram allow set, so a hot histogram can't become a firehose.
+//!   Enable at runtime by calling `.stream(filter)` on the builder — no Cargo feature needed.
 //!
 //! # Fixed target, runtime scope
 //!
@@ -36,10 +37,9 @@
 //! ```
 
 mod emit;
-#[cfg(feature = "stream")]
 mod filter;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,12 +50,20 @@ use metrics_util::registry::{AtomicStorage, Registry};
 use metrics_util::storage::Summary;
 use tracing::Level;
 
-#[cfg(feature = "stream")]
 pub use filter::{StreamFilter, StreamFilterBuilder};
 
 use emit::TARGET;
-#[cfg(feature = "stream")]
 use emit::{StreamContext, StreamingCounter, StreamingGauge, StreamingHistogram};
+
+/// Aggregated histogram statistics for one snapshot tick (total count/sum plus DDSketch quantiles).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSummary {
+    pub count: usize,
+    pub sum: f64,
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+}
 
 /// One computed metric sample produced by a snapshot poll. Exposed so consumers (and tests) can
 /// observe what a tick would emit without capturing tracing output.
@@ -71,11 +79,7 @@ pub enum Sample {
     },
     Histogram {
         metric: String,
-        count: usize,
-        sum: f64,
-        p50: f64,
-        p90: f64,
-        p99: f64,
+        summary: HistogramSummary,
     },
 }
 
@@ -89,11 +93,14 @@ struct Inner {
     registry: Registry<Key, AtomicStorage>,
     // Summary exposes no sum accessor, so we accumulate the running sum beside each sketch.
     summaries: Mutex<HashMap<Key, (Summary, f64)>>,
-    #[cfg(feature = "stream")]
     stream: Option<Arc<StreamContext>>,
+    // describe_* fires on the Recorder at register-time; level and scope must live here, not only
+    // on Poller.
+    level: Level,
+    scope: Arc<str>,
+    described: Mutex<HashSet<(String, &'static str)>>,
 }
 
-#[cfg(feature = "stream")]
 impl Inner {
     fn streaming(&self, metric: &str, is_histogram: bool) -> Option<Arc<StreamContext>> {
         let ctx = self.stream.as_ref()?;
@@ -106,32 +113,112 @@ impl Inner {
     }
 }
 
-fn render_key(key: &Key) -> String {
+/// The emit macro collapses WARN/ERROR to INFO at dispatch — that's intentional and separate.
+fn map_level(level: metrics::Level) -> Level {
+    if level == metrics::Level::TRACE {
+        Level::TRACE
+    } else if level == metrics::Level::DEBUG {
+        Level::DEBUG
+    } else if level == metrics::Level::WARN {
+        Level::WARN
+    } else if level == metrics::Level::ERROR {
+        Level::ERROR
+    } else {
+        Level::INFO
+    }
+}
+
+fn render_labels(key: &Key) -> String {
     let mut labels = key.labels().peekable();
     if labels.peek().is_none() {
+        return String::new();
+    }
+    labels
+        .map(|l| format!("{}={}", l.key(), l.value()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn render_key(key: &Key) -> String {
+    let labels = render_labels(key);
+    if labels.is_empty() {
         return key.name().to_string();
     }
-    let rendered: Vec<String> = labels
-        .map(|l| format!("{}={}", l.key(), l.value()))
-        .collect();
-    format!("{}{{{}}}", key.name(), rendered.join(","))
+    format!("{}{{{}}}", key.name(), labels)
 }
 
 impl Recorder for TracingRecorder {
-    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        let newly = self
+            .inner
+            .described
+            .lock()
+            .expect("described lock")
+            .insert((key.as_str().to_string(), "counter"));
+        if newly {
+            emit_describe(
+                self.inner.level,
+                &self.inner.scope,
+                key.as_str(),
+                "counter",
+                &description,
+                unit.as_ref(),
+            );
+        }
+    }
 
-    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        #[cfg(feature = "stream")]
-        {
+    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        let newly = self
+            .inner
+            .described
+            .lock()
+            .expect("described lock")
+            .insert((key.as_str().to_string(), "gauge"));
+        if newly {
+            emit_describe(
+                self.inner.level,
+                &self.inner.scope,
+                key.as_str(),
+                "gauge",
+                &description,
+                unit.as_ref(),
+            );
+        }
+    }
+
+    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        let newly = self
+            .inner
+            .described
+            .lock()
+            .expect("described lock")
+            .insert((key.as_str().to_string(), "histogram"));
+        if newly {
+            emit_describe(
+                self.inner.level,
+                &self.inner.scope,
+                key.as_str(),
+                "histogram",
+                &description,
+                unit.as_ref(),
+            );
+        }
+    }
+
+    fn register_counter(&self, key: &Key, metadata: &Metadata<'_>) -> Counter {
+        // Only render the key when streaming is enabled; the snapshot-only path allocates nothing.
+        if self.inner.stream.is_some() {
             let rendered = render_key(key);
-            // Wrap the registry's own Arc so streamed updates and snapshots see the same atomic.
             if let Some(ctx) = self.inner.streaming(&rendered, false) {
+                let level = map_level(*metadata.level());
+                let labels = render_labels(key);
+                // Wrap the registry's own Arc so streamed updates and snapshots see the same atomic.
                 return self.inner.registry.get_or_create_counter(key, |c| {
                     Counter::from_arc(Arc::new(StreamingCounter::new(
                         c.clone(),
                         rendered.into(),
+                        labels.into(),
+                        level,
                         ctx,
                     )))
                 });
@@ -142,15 +229,18 @@ impl Recorder for TracingRecorder {
             .get_or_create_counter(key, |c| Counter::from_arc(c.clone()))
     }
 
-    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        #[cfg(feature = "stream")]
-        {
+    fn register_gauge(&self, key: &Key, metadata: &Metadata<'_>) -> Gauge {
+        if self.inner.stream.is_some() {
             let rendered = render_key(key);
             if let Some(ctx) = self.inner.streaming(&rendered, false) {
+                let level = map_level(*metadata.level());
+                let labels = render_labels(key);
                 return self.inner.registry.get_or_create_gauge(key, |g| {
                     Gauge::from_arc(Arc::new(StreamingGauge::new(
                         g.clone(),
                         rendered.into(),
+                        labels.into(),
+                        level,
                         ctx,
                     )))
                 });
@@ -161,15 +251,18 @@ impl Recorder for TracingRecorder {
             .get_or_create_gauge(key, |g| Gauge::from_arc(g.clone()))
     }
 
-    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        #[cfg(feature = "stream")]
-        {
+    fn register_histogram(&self, key: &Key, metadata: &Metadata<'_>) -> Histogram {
+        if self.inner.stream.is_some() {
             let rendered = render_key(key);
             if let Some(ctx) = self.inner.streaming(&rendered, true) {
+                let level = map_level(*metadata.level());
+                let labels = render_labels(key);
                 return self.inner.registry.get_or_create_histogram(key, |h| {
                     Histogram::from_arc(Arc::new(StreamingHistogram::new(
                         h.clone(),
                         rendered.into(),
+                        labels.into(),
+                        level,
                         ctx,
                     )))
                 });
@@ -186,7 +279,6 @@ pub struct Builder {
     interval: Duration,
     level: Level,
     scope: String,
-    #[cfg(feature = "stream")]
     stream: Option<StreamFilter>,
     on_tick: Option<Box<dyn Fn() + Send + 'static>>,
 }
@@ -197,7 +289,6 @@ impl Default for Builder {
             interval: Duration::from_secs(3),
             level: Level::INFO,
             scope: String::new(),
-            #[cfg(feature = "stream")]
             stream: None,
             on_tick: None,
         }
@@ -225,7 +316,6 @@ impl Builder {
     }
 
     /// Enable the per-call event stream, filtered by `f`.
-    #[cfg(feature = "stream")]
     pub fn stream(mut self, f: StreamFilter) -> Self {
         self.stream = Some(f);
         self
@@ -242,10 +332,8 @@ impl Builder {
     /// Build the recorder and poller for manual composition (e.g. behind a `Fanout`).
     pub fn build(self) -> (TracingRecorder, Poller) {
         let scope: Arc<str> = Arc::from(self.scope.as_str());
-        #[cfg(feature = "stream")]
         let stream = self.stream.map(|filter| {
             Arc::new(StreamContext {
-                level: self.level,
                 scope: scope.clone(),
                 filter: Arc::new(filter),
             })
@@ -253,8 +341,10 @@ impl Builder {
         let inner = Arc::new(Inner {
             registry: Registry::atomic(),
             summaries: Mutex::new(HashMap::new()),
-            #[cfg(feature = "stream")]
             stream,
+            level: self.level,
+            scope: scope.clone(),
+            described: Mutex::new(HashSet::new()),
         });
         let recorder = TracingRecorder {
             inner: inner.clone(),
@@ -332,11 +422,13 @@ impl Poller {
             }
             samples.push(Sample::Histogram {
                 metric: render_key(&key),
-                count: summary.count(),
-                sum: *sum,
-                p50: summary.quantile(0.5).unwrap_or(f64::NAN),
-                p90: summary.quantile(0.9).unwrap_or(f64::NAN),
-                p99: summary.quantile(0.99).unwrap_or(f64::NAN),
+                summary: HistogramSummary {
+                    count: summary.count(),
+                    sum: *sum,
+                    p50: summary.quantile(0.5).unwrap_or(f64::NAN),
+                    p90: summary.quantile(0.9).unwrap_or(f64::NAN),
+                    p99: summary.quantile(0.99).unwrap_or(f64::NAN),
+                },
             });
         }
 
@@ -352,23 +444,9 @@ impl Poller {
                 Sample::Gauge { metric, value } => {
                     emit_snapshot_gauge(self.level, &self.scope, &metric, value)
                 }
-                Sample::Histogram {
-                    metric,
-                    count,
-                    sum,
-                    p50,
-                    p90,
-                    p99,
-                } => emit_snapshot_histogram(
-                    self.level,
-                    &self.scope,
-                    &metric,
-                    count,
-                    sum,
-                    p50,
-                    p90,
-                    p99,
-                ),
+                Sample::Histogram { metric, summary } => {
+                    emit_snapshot_histogram(self.level, &self.scope, &metric, &summary)
+                }
             }
         }
     }
@@ -377,12 +455,14 @@ impl Poller {
     pub fn spawn(self) -> std::io::Result<()> {
         thread::Builder::new()
             .name("metrics-snapshot".into())
-            .spawn(move || loop {
-                thread::sleep(self.interval);
-                if let Some(tick) = &self.on_tick {
-                    tick();
+            .spawn(move || {
+                loop {
+                    thread::sleep(self.interval);
+                    if let Some(tick) = &self.on_tick {
+                        tick();
+                    }
+                    self.emit_snapshot();
                 }
-                self.emit_snapshot();
             })?;
         Ok(())
     }
@@ -420,23 +500,38 @@ fn emit_snapshot_gauge(level: Level, scope: &str, metric: &str, value: f64) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_snapshot_histogram(
-    level: Level,
-    scope: &str,
-    metric: &str,
-    count: usize,
-    sum: f64,
-    p50: f64,
-    p90: f64,
-    p99: f64,
-) {
+fn emit_snapshot_histogram(level: Level, scope: &str, metric: &str, summary: &HistogramSummary) {
     macro_rules! e {
         ($lvl:expr) => {
             tracing::event!(
                 target: TARGET, $lvl,
                 event = "snapshot", scope, metric, kind = "histogram",
-                count, sum, p50, p90, p99
+                count = summary.count, sum = summary.sum,
+                p50 = summary.p50, p90 = summary.p90, p99 = summary.p99
+            )
+        };
+    }
+    match level {
+        Level::TRACE => e!(Level::TRACE),
+        Level::DEBUG => e!(Level::DEBUG),
+        _ => e!(Level::INFO),
+    }
+}
+
+fn emit_describe(
+    level: Level,
+    scope: &str,
+    metric: &str,
+    kind: &str,
+    description: &str,
+    unit: Option<&Unit>,
+) {
+    let unit = unit.map(|u| u.as_str()).unwrap_or("");
+    macro_rules! e {
+        ($lvl:expr) => {
+            tracing::event!(
+                target: TARGET, $lvl,
+                event = "describe", scope, metric, kind, description, unit
             )
         };
     }
@@ -543,9 +638,9 @@ mod tests {
             .find(|s| matches!(s, Sample::Histogram { metric, .. } if metric == "lat"))
             .expect("histogram sample")
         {
-            Sample::Histogram { count, sum, .. } => {
-                assert_eq!(*count, 4);
-                assert_eq!(*sum, 10.0);
+            Sample::Histogram { summary, .. } => {
+                assert_eq!(summary.count, 4);
+                assert_eq!(summary.sum, 10.0);
             }
             _ => unreachable!(),
         }
@@ -561,6 +656,42 @@ mod tests {
     }
 
     #[test]
+    fn describe_deduplicates_by_name_and_kind() {
+        let (recorder, _poller) = TracingRecorder::builder().scope("test").build();
+        recorder.describe_counter(
+            KeyName::from("hits"),
+            None,
+            SharedString::from("total hits"),
+        );
+        recorder.describe_counter(
+            KeyName::from("hits"),
+            None,
+            SharedString::from("total hits again"),
+        );
+        {
+            let described = recorder.inner.described.lock().expect("described lock");
+            assert_eq!(
+                described.len(),
+                1,
+                "second describe_counter must not re-insert"
+            );
+        }
+        recorder.describe_gauge(
+            KeyName::from("hits"),
+            None,
+            SharedString::from("hits as gauge"),
+        );
+        {
+            let described = recorder.inner.described.lock().expect("described lock");
+            assert_eq!(
+                described.len(),
+                2,
+                "different kind must produce a new entry"
+            );
+        }
+    }
+
+    #[test]
     fn histogram_sketch_persists_across_polls() {
         // Each poll drains the bucket; the sketch must keep the prior count so cumulative quantiles
         // stay correct across ticks.
@@ -571,7 +702,7 @@ mod tests {
         let first = poller.poll_once();
         assert!(matches!(
             first.iter().find(|s| matches!(s, Sample::Histogram { .. })),
-            Some(Sample::Histogram { count: 1, .. })
+            Some(Sample::Histogram { summary, .. }) if summary.count == 1
         ));
 
         with_local_recorder(&recorder, || h.record(2.0));
@@ -581,11 +712,38 @@ mod tests {
             .find(|s| matches!(s, Sample::Histogram { .. }))
             .unwrap()
         {
-            Sample::Histogram { count, sum, .. } => {
-                assert_eq!(*count, 2);
-                assert_eq!(*sum, 3.0);
+            Sample::Histogram { summary, .. } => {
+                assert_eq!(summary.count, 2);
+                assert_eq!(summary.sum, 3.0);
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn map_level_maps_each_variant() {
+        assert_eq!(map_level(metrics::Level::TRACE), Level::TRACE);
+        assert_eq!(map_level(metrics::Level::DEBUG), Level::DEBUG);
+        assert_eq!(map_level(metrics::Level::INFO), Level::INFO);
+        assert_eq!(map_level(metrics::Level::WARN), Level::WARN);
+        assert_eq!(map_level(metrics::Level::ERROR), Level::ERROR);
+    }
+
+    #[test]
+    fn render_labels_formats_correctly() {
+        let key_bare = Key::from_name("hits");
+        assert_eq!(render_labels(&key_bare), "");
+
+        let key_one = Key::from_parts("frames", vec![metrics::Label::new("display", "0")]);
+        assert_eq!(render_labels(&key_one), "display=0");
+
+        let key_two = Key::from_parts(
+            "frames",
+            vec![
+                metrics::Label::new("display", "0"),
+                metrics::Label::new("enc", "jxl"),
+            ],
+        );
+        assert_eq!(render_labels(&key_two), "display=0,enc=jxl");
     }
 }

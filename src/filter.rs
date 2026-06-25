@@ -1,7 +1,5 @@
 //! Compile a set of glob patterns into a fast key matcher for the per-call stream.
 
-#![cfg(feature = "stream")]
-
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// Decides which metric keys produce per-call `tracing` events.
@@ -19,10 +17,8 @@ pub struct StreamFilter {
 }
 
 impl StreamFilter {
-    /// Start an empty filter (allow-all for counters/gauges, no histogram streaming).
-    // `new` returns a builder, not Self, by deliberate API design.
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> StreamFilterBuilder {
+    /// Start building a filter (allow-all for counters/gauges, no histogram streaming).
+    pub fn builder() -> StreamFilterBuilder {
         StreamFilterBuilder::default()
     }
 
@@ -99,9 +95,8 @@ impl StreamFilterBuilder {
 fn compile(patterns: &[String]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
-        if let Ok(glob) = Glob::new(p) {
-            builder.add(glob);
-        }
+        let Ok(glob) = Glob::new(p) else { continue };
+        builder.add(glob);
     }
     builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
@@ -112,21 +107,21 @@ mod tests {
 
     #[test]
     fn empty_allow_matches_everything() {
-        let f = StreamFilter::new().build();
+        let f = StreamFilter::builder().build();
         assert!(f.allows("anything"));
         assert!(f.allows("frame_count{display=0}"));
     }
 
     #[test]
     fn allow_restricts_to_matching_keys() {
-        let f = StreamFilter::new().allow(["frame_*"]).build();
+        let f = StreamFilter::builder().allow(["frame_*"]).build();
         assert!(f.allows("frame_count"));
         assert!(!f.allows("bytes_sent"));
     }
 
     #[test]
     fn deny_wins_over_allow() {
-        let f = StreamFilter::new()
+        let f = StreamFilter::builder()
             .allow(["frame_*"])
             .deny(["frame_internal"])
             .build();
@@ -137,17 +132,17 @@ mod tests {
     #[test]
     fn histograms_require_explicit_opt_in() {
         // General allow does not enable histogram streaming.
-        let f = StreamFilter::new().allow(["*"]).build();
+        let f = StreamFilter::builder().allow(["*"]).build();
         assert!(!f.allows_histogram("latency_ms"));
 
-        let f = StreamFilter::new().histograms(["latency_*"]).build();
+        let f = StreamFilter::builder().histograms(["latency_*"]).build();
         assert!(f.allows_histogram("latency_ms"));
         assert!(!f.allows_histogram("queue_depth"));
     }
 
     #[test]
     fn deny_also_suppresses_histogram_streaming() {
-        let f = StreamFilter::new()
+        let f = StreamFilter::builder()
             .histograms(["latency_*"])
             .deny(["latency_debug"])
             .build();
@@ -157,7 +152,7 @@ mod tests {
 
     #[test]
     fn rendered_key_with_labels_matches() {
-        let f = StreamFilter::new().allow(["frame_count{*}"]).build();
+        let f = StreamFilter::builder().allow(["frame_count{*}"]).build();
         assert!(f.allows("frame_count{display=0}"));
     }
 }
