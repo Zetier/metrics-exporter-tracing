@@ -72,6 +72,25 @@ Describe events (`event = "describe"`):
 
 Description events are emitted only once per `(name, kind)` pair.
 
+## Aggregated snapshots
+
+Enable `prometheus` to emit snapshots using `prometheus-client`'s types:
+
+```rust
+use metrics_exporter_tracing::TracingRecorder;
+use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::MetricFamily;
+
+fn export(recorder: &TracingRecorder, metrics: &[MetricFamily]) {
+    recorder.emit_snapshot(metrics);
+}
+```
+
+Calls emit `event="snapshot"` synchronously at the recorder's default level and
+target, preserving source labels. The caller controls collection and scheduling.
+Counter and gauge values are numeric. Each histogram emits one event with numeric
+count, sum, schema, and zero-bucket fields, plus debug-formatted bucket collections
+in their original Prometheus encoding. Other metric types are ignored.
+
 ## Notes
 
 - Events are emitted synchronously on the metrics call path.

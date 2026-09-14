@@ -4,6 +4,11 @@
 //! visibility during development. Metrics are emitted synchronously on the
 //! metrics call path as structured `tracing` events.
 
+#[cfg(feature = "prometheus")]
+mod prometheus;
+#[cfg(feature = "prometheus")]
+use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::MetricFamily;
+
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +34,35 @@ impl TracingRecorder {
     /// Creates a recorder with defaults: level TRACE and target "metrics".
     pub fn new() -> Self {
         Self::builder().build()
+    }
+
+    /// Emits counter/gauge values and histogram aggregates; other types are ignored.
+    /// Uses the configured default target and level. Aggregates emit
+    /// `event = "snapshot"` instead of observation events.
+    #[cfg(feature = "prometheus")]
+    pub fn emit_snapshot(&self, metrics: &[MetricFamily]) {
+        prometheus::emit(self, metrics);
+    }
+
+    #[cfg(feature = "prometheus")]
+    fn emit_statistic(&self, key: &Key, kind: &str, statistic: &str, value: &dyn Value) {
+        let event = "snapshot";
+        let name = key.name();
+        let labels = field::debug(LabelsDebug::from_key(key));
+        let values: [Option<&dyn Value>; 6] = [
+            Some(&event),
+            Some(&name),
+            Some(&kind),
+            Some(&labels),
+            Some(&statistic),
+            Some(value),
+        ];
+        self.inner.dispatch_event(
+            Schema::Snapshot,
+            &self.inner.default_target,
+            self.inner.default_level,
+            &values,
+        );
     }
 
     /// Returns a builder to configure a [`TracingRecorder`].
@@ -325,6 +359,10 @@ enum MetricKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum Schema {
+    #[cfg(feature = "prometheus")]
+    Snapshot,
+    #[cfg(feature = "prometheus")]
+    HistogramSnapshot,
     Emit,
     Describe,
 }
@@ -332,6 +370,27 @@ enum Schema {
 impl Schema {
     fn field_names(self) -> &'static [&'static str] {
         match self {
+            #[cfg(feature = "prometheus")]
+            Schema::Snapshot => &["event", "name", "kind", "labels", "statistic", "value"],
+            #[cfg(feature = "prometheus")]
+            Schema::HistogramSnapshot => &[
+                "event",
+                "name",
+                "kind",
+                "labels",
+                "count",
+                "sum",
+                "schema",
+                "zero_threshold",
+                "zero_count",
+                "buckets",
+                "positive_spans",
+                "positive_deltas",
+                "positive_counts",
+                "negative_spans",
+                "negative_deltas",
+                "negative_counts",
+            ],
             Schema::Emit => &EMIT_FIELDS,
             Schema::Describe => &DESCRIBE_FIELDS,
         }
@@ -648,6 +707,104 @@ mod tests {
             .get("fields")
             .and_then(Value::as_object)
             .expect("fields object")
+    }
+
+    #[cfg(feature = "prometheus")]
+    mod snapshots {
+        use super::*;
+        use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::{
+            Bucket, BucketSpan, Histogram, LabelPair, Metric, MetricFamily, MetricType,
+        };
+
+        fn histogram() -> MetricFamily {
+            MetricFamily {
+                name: "latency".into(),
+                r#type: MetricType::Histogram.into(),
+                metric: vec![Metric {
+                    label: vec![LabelPair {
+                        name: "session_id".into(),
+                        value: "7".into(),
+                    }],
+                    histogram: Some(Histogram {
+                        sample_count: u64::MAX,
+                        sample_sum: 1.5,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn histogram_snapshot_preserves_event_fields_and_bucket_encoding() {
+            let recorder = TracingRecorder::builder()
+                .default_target("received.metrics")
+                .default_level(TracingLevel::INFO)
+                .build();
+            let mut metric = histogram();
+            let histogram = metric.metric[0].histogram.as_mut().unwrap();
+            histogram.bucket = vec![Bucket {
+                cumulative_count: 2,
+                upper_bound: 1.0,
+                ..Default::default()
+            }];
+            histogram.schema = 2;
+            histogram.zero_threshold = 0.01;
+            histogram.zero_count = 1;
+            histogram.positive_span = vec![BucketSpan {
+                offset: 3,
+                length: 2,
+            }];
+            histogram.positive_delta = vec![2, -1];
+            histogram.negative_span = vec![BucketSpan {
+                offset: -2,
+                length: 1,
+            }];
+            histogram.negative_delta = vec![3];
+            let expected = [
+                ("buckets", format!("{:?}", histogram.bucket)),
+                ("positive_spans", format!("{:?}", histogram.positive_span)),
+                ("positive_deltas", format!("{:?}", histogram.positive_delta)),
+                ("negative_spans", format!("{:?}", histogram.negative_span)),
+                ("negative_deltas", format!("{:?}", histogram.negative_delta)),
+            ];
+            let events = capture_events(|| recorder.emit_snapshot(&[metric]));
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["target"], "received.metrics");
+            assert_eq!(events[0]["level"], "INFO");
+            let fields = event_fields(&events[0]);
+            assert_eq!(fields["event"], "snapshot");
+            assert_eq!(fields["name"], "latency");
+            assert_eq!(fields["kind"], "histogram");
+            assert_eq!(fields["labels"], r#"{"session_id": "7"}"#);
+            assert_eq!(fields["count"], u64::MAX);
+            assert_eq!(fields["sum"], 1.5);
+            assert_eq!(fields["schema"], 2);
+            assert_eq!(fields["zero_threshold"], 0.01);
+            assert_eq!(fields["zero_count"], 1);
+            for (name, value) in expected {
+                assert_eq!(fields[name], value);
+            }
+        }
+
+        #[test]
+        fn histogram_snapshot_prefers_float_counts_over_integer_counts() {
+            let recorder = TracingRecorder::new();
+            let mut metric = histogram();
+            let histogram = metric.metric[0].histogram.as_mut().unwrap();
+            histogram.sample_count_float = 2.5;
+            histogram.zero_count = u64::MAX;
+            histogram.zero_count_float = 0.5;
+            histogram.positive_count = vec![1.25];
+            histogram.negative_count = vec![0.75];
+            let events = capture_events(|| recorder.emit_snapshot(&[metric]));
+            let fields = event_fields(&events[0]);
+            assert_eq!(fields["count"], 2.5);
+            assert_eq!(fields["zero_count"], 0.5);
+            assert_eq!(fields["positive_counts"], "[1.25]");
+            assert_eq!(fields["negative_counts"], "[0.75]");
+        }
     }
 
     #[test]
